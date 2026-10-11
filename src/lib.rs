@@ -20,6 +20,31 @@ pub enum Path<'p> {
     Key(&'p Path<'p>, CompactString),
 }
 
+impl<'p> Path<'p> {
+    pub fn matches(&self, pattern: &[&str]) -> bool {
+        let mut path = self;
+        let mut segments = pattern.iter().rev();
+        while let Some(&segment) = segments.next() {
+            path = match path {
+                Self::Root => return segment == "<root>" && segments.next().is_none(),
+                Self::Index(parent, index) => {
+                    if segment != "*" && segment.parse::<usize>().ok() != Some(*index) {
+                        return false;
+                    }
+                    parent
+                }
+                Self::Key(parent, key) => {
+                    if segment != "*" && segment != key.as_str() {
+                        return false;
+                    }
+                    parent
+                }
+            };
+        }
+        false
+    }
+}
+
 impl fmt::Display for Path<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -451,6 +476,62 @@ mod tests {
         ] {
             assert_eq!(path.to_string(), expected);
         }
+    }
+
+    #[test]
+    fn paths_match_exact_layers_and_wildcards() {
+        let root = Path::Root;
+        let config = Path::Key(&root, CompactString::const_new("config"));
+        let index = Path::Index(&config, 3);
+        let field = Path::Key(&index, CompactString::const_new("deprecated_field"));
+
+        assert!(root.matches(&["<root>"]));
+        assert!(!root.matches(&[]));
+        assert!(!root.matches(&["*"]));
+        assert!(config.matches(&["<root>", "config"]));
+        assert!(index.matches(&["<root>", "config", "3"]));
+        assert!(index.matches(&["<root>", "config", "*"]));
+
+        for pattern in [
+            ["<root>", "config", "3", "deprecated_field"],
+            ["<root>", "config", "*", "deprecated_field"],
+            ["<root>", "*", "3", "deprecated_field"],
+            ["<root>", "config", "3", "*"],
+        ] {
+            assert!(field.matches(&pattern));
+        }
+        for pattern in [
+            ["<root>", "config", "2", "deprecated_field"],
+            ["<root>", "config", "invalid", "deprecated_field"],
+            [
+                "<root>",
+                "config",
+                "9999999999999999999999999999999999999999",
+                "deprecated_field",
+            ],
+            ["<root>", "other", "3", "deprecated_field"],
+            ["root", "config", "3", "deprecated_field"],
+            ["<root>", "config", "3", "other"],
+        ] {
+            assert!(!field.matches(&pattern));
+        }
+        assert!(!field.matches(&["config", "3", "deprecated_field"]));
+        assert!(!field.matches(&["<root>", "config", "deprecated_field"]));
+        assert!(!field.matches(&["<root>", "config", "3", "deprecated_field", "extra"]));
+    }
+
+    #[test]
+    fn path_matching_preserves_literal_keys() {
+        let root = Path::Root;
+        let config = Path::Key(&root, CompactString::const_new("config.with.dots"));
+        let entry = Path::Key(&config, CompactString::const_new("items[3]"));
+        let field = Path::Key(&entry, CompactString::const_new("世界"));
+        assert!(field.matches(&["<root>", "config.with.dots", "items[3]", "世界"]));
+        assert!(!field.matches(&["<root>", "config", "with", "dots", "items[3]", "世界"]));
+
+        let key = Path::Key(&root, CompactString::const_new("<root>"));
+        assert!(key.matches(&["<root>", "<root>"]));
+        assert!(!key.matches(&["<root>"]));
     }
 
     #[derive(Debug, Deserialize, PartialEq)]

@@ -21,7 +21,9 @@ fn main() -> Result<(), serde_json::Error> {
         r#"{"port":8080,"future":{"nested":true}}"#,
     );
     let config: Config = (&mut deserializer).deserialize(|path| {
-        eprintln!("Unknown field: {path}");
+        if path.matches(&["<root>", "future"]) {
+            eprintln!("Unknown field: {path}");
+        }
     })?;
     deserializer.end()?;
     assert_eq!(config.port, 8080);
@@ -32,6 +34,13 @@ fn main() -> Result<(), serde_json::Error> {
 Paths use a stack-linked list. Keys use `CompactString`, so short keys stay inline
 while long keys may allocate. Invalid values and duplicate fields still return
 errors. Map keys are unrestricted. Flattened fields are not tracked.
+
+`Path::matches` compares the complete path without formatting or allocation.
+Patterns run from root to leaf and start with `"<root>"`. `"*"` matches one key
+or sequence index; indices use decimal numbers, such as `"3"`. For example,
+`path.matches(&["<root>", "config", "*", "deprecated_field"])` matches the field
+under one entry in `config`. Keys containing dots or brackets remain one segment.
+Matching takes linear time in the compared segments and constant auxiliary space.
 
 ## Features
 
