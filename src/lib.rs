@@ -11,14 +11,41 @@ use pastey::paste;
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
+/// A path represented by nodes that borrow their parents.
+///
+/// Callbacks receive a temporary path. [`Path::matches`] compares its segments
+/// without allocating. [`Display`](fmt::Display) prints keys separated by dots
+/// and indices in brackets, omitting the root prefix for non-root paths.
 #[derive(Debug)]
 pub enum Path<'p> {
+    /// The root value, displayed as `<root>`.
     Root,
+    /// A sequence element with its parent path and zero-based index.
     Index(&'p Path<'p>, usize),
+    /// A map or struct value with its parent path and key.
     Key(&'p Path<'p>, CompactString),
 }
 
 impl<'p> Path<'p> {
+    /// Matches the entire path against root-to-leaf segments without allocating.
+    ///
+    /// The first segment must be `"<root>"`. `"*"` matches exactly one key or
+    /// sequence index, but cannot replace the root segment. Indices are compared
+    /// as `usize` values. Dots and brackets inside keys are literal; `"*"` has no
+    /// escape syntax. Matching takes linear time and constant auxiliary space.
+    ///
+    /// ```
+    /// use serde_unknown::Path;
+    ///
+    /// let root = Path::Root;
+    /// let items = Path::Key(&root, "items".into());
+    /// let entry = Path::Index(&items, 3);
+    /// let extra = Path::Key(&entry, "extra".into());
+    ///
+    /// assert!(extra.matches(&["<root>", "items", "3", "extra"]));
+    /// assert!(extra.matches(&["<root>", "items", "*", "extra"]));
+    /// assert!(!extra.matches(&["items", "3", "extra"]));
+    /// ```
     pub fn matches(&self, pattern: &[&str]) -> bool {
         let mut path = self;
         let mut segments = pattern.iter().rev();
@@ -76,6 +103,10 @@ macro_rules! implement {
         $context:ty $(where [$($bound:tt)*])?
     ) => {
         implement! { #impl [$($generic)*] ($($header)*) $(where [$($bound)*])?;
+            /// Deserializes `T` using the configured callbacks.
+            ///
+            /// Returns the first callback error unchanged, or the underlying
+            /// deserializer's result when no callback rejects the input.
             pub fn deserialize<T: Deserialize<'de>>(self) -> Result<T, $error> {
                 Builder {
                     deserializer: self.deserializer,
@@ -102,7 +133,45 @@ macro_rules! implement {
     };
 }
 
+/// Unknown-field handling for any Serde [`Deserializer`].
+///
+/// Import this trait to call [`.deserialize(callback)`](Self::deserialize) or
+/// [`.track()`](Self::track) on a deserializer. The adapter supports structs that
+/// would otherwise reject unknown fields, including pbjson-generated messages.
+/// Known values retain the target type's deserialization behavior.
+///
+/// Unknown-field tracking does not support `#[serde(flatten)]`. Paths borrow
+/// stack-local nodes and cannot be kept after the callback returns.
 pub trait DeserializerExt<'de>: Deserializer<'de> {
+    /// Deserializes `T`, calling `callback` before each unknown value is consumed.
+    ///
+    /// Return `Ok(())` to continue or `Self::Error` to reject the input. The first
+    /// callback error is returned unchanged even if nested deserialization uses
+    /// a different error type or catches the intermediate error. No further
+    /// callbacks run after rejection. An unknown subtree produces one callback.
+    ///
+    /// ```
+    /// use serde::Deserialize;
+    /// use serde_unknown::DeserializerExt;
+    ///
+    /// #[derive(Deserialize)]
+    /// #[serde(deny_unknown_fields)]
+    /// struct Config { port: u16 }
+    ///
+    /// let mut deserializer = serde_json::Deserializer::from_str(
+    ///     r#"{"port":8080,"future":true}"#,
+    /// );
+    /// let mut count = 0;
+    /// let config: Config = (&mut deserializer).deserialize(|path| {
+    ///     assert!(path.matches(&["<root>", "future"]));
+    ///     count += 1;
+    ///     Ok(())
+    /// })?;
+    /// deserializer.end()?;
+    /// assert_eq!(config.port, 8080);
+    /// assert_eq!(count, 1);
+    /// # Ok::<(), serde_json::Error>(())
+    /// ```
     fn deserialize<T, F>(self, mut callback: F) -> Result<T, Self::Error>
     where
         T: Deserialize<'de>,
@@ -113,6 +182,11 @@ pub trait DeserializerExt<'de>: Deserializer<'de> {
             .deserialize()
     }
 
+    /// Creates a [`Builder`] with neither callback configured.
+    ///
+    /// Use [`Builder::filter`] to select unknown values or reject their paths.
+    /// With the `peek` feature, `Builder::peek` can inspect their parsed values.
+    /// With neither callback, unknown values are consumed directly.
     fn track(self) -> Builder<Self> {
         Builder {
             deserializer: self,
@@ -124,6 +198,21 @@ pub trait DeserializerExt<'de>: Deserializer<'de> {
 
 impl<'de, D: Deserializer<'de>> DeserializerExt<'de> for D {}
 
+/// Configures optional callbacks before deserializing a value.
+///
+/// Created by [`DeserializerExt::track`]. Callbacks retain their concrete types
+/// and need no boxing. [`filter`](Self::filter) and `peek` (with the `peek`
+/// feature) can be configured in either order. Call `.deserialize()` to execute.
+///
+/// | Callbacks | Behavior |
+/// | --- | --- |
+/// | Neither | Consume unknown values without calling user code. |
+/// | Filter only | Run the filter and consume values directly. |
+/// | Peek only | Inspect every unknown value with context `None::<()>`. |
+/// | Both | Inspect selected values with the filter's `Some(context)`. |
+///
+/// Filter and peek errors reject the input. The first callback error is returned
+/// unchanged, even if nested code catches the intermediate error.
 #[must_use]
 pub struct Builder<D, F = (), P = ()> {
     deserializer: D,
@@ -132,6 +221,35 @@ pub struct Builder<D, F = (), P = ()> {
 }
 
 impl<D, F, P> Builder<D, F, P> {
+    /// Sets a callback that runs before an unknown value is consumed.
+    ///
+    /// Return `Some(context)` to select the value for `peek`, `None` to consume
+    /// it directly, or `D::Error` to reject the input. The context type `C` is
+    /// chosen by the caller; `peek` receives `Some(context)` for selected values.
+    /// Without a peek callback, both successful results consume values directly.
+    /// Calling this method again replaces the previous filter.
+    ///
+    /// ```
+    /// use serde::{Deserialize, de::Error};
+    /// use serde_unknown::DeserializerExt;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct Config { port: u16 }
+    ///
+    /// let mut deserializer = serde_json::Deserializer::from_str(
+    ///     r#"{"port":8080,"forbidden":true}"#,
+    /// );
+    /// let result: Result<Config, _> = (&mut deserializer)
+    ///     .track()
+    ///     .filter(|path| {
+    ///         if path.matches(&["<root>", "forbidden"]) {
+    ///             return Err(Error::custom("forbidden field"));
+    ///         }
+    ///         Ok(None::<()>)
+    ///     })
+    ///     .deserialize();
+    /// assert_eq!(result.err().unwrap().to_string(), "forbidden field");
+    /// ```
     pub fn filter<'de, C, Filter>(self, filter: Filter) -> Builder<D, Filter, P>
     where
         D: Deserializer<'de>,
@@ -144,6 +262,43 @@ impl<D, F, P> Builder<D, F, P> {
         }
     }
 
+    /// Sets a callback that receives an owned JSON value for selected fields.
+    ///
+    /// Requires the `peek` feature. A filter supplies `Some(context)`; returning
+    /// `None` from the filter skips this callback. Without a filter, every unknown
+    /// value is selected and the context is `None` with type `Option<()>`.
+    ///
+    /// The callback runs after the complete subtree is parsed. It is not called
+    /// if parsing fails. Return `Ok(())` to continue or `D::Error` to reject the
+    /// input. Calling this method again replaces the previous peek callback.
+    ///
+    /// Inspection can allocate and requires `deserialize_any` support and values
+    /// representable by [`serde_json::Value`]. Duplicate object keys and some
+    /// format-specific representations are not preserved.
+    ///
+    /// ```
+    /// use serde::Deserialize;
+    /// use serde_unknown::DeserializerExt;
+    ///
+    /// #[derive(Deserialize)]
+    /// struct Config { port: u16 }
+    ///
+    /// let mut deserializer = serde_json::Deserializer::from_str(
+    ///     r#"{"port":8080,"future":{"enabled":true},"other":false}"#,
+    /// );
+    /// let config: Config = (&mut deserializer)
+    ///     .track()
+    ///     .filter(|path| Ok(path.matches(&["<root>", "future"]).then_some("future")))
+    ///     .peek(|_, context, value| {
+    ///         assert_eq!(context, Some("future"));
+    ///         assert_eq!(value, serde_json::json!({"enabled": true}));
+    ///         Ok(())
+    ///     })
+    ///     .deserialize()?;
+    /// deserializer.end()?;
+    /// assert_eq!(config.port, 8080);
+    /// # Ok::<(), serde_json::Error>(())
+    /// ```
     #[cfg(feature = "peek")]
     pub fn peek<'de, C, Peek>(self, peek: Peek) -> Builder<D, F, Peek>
     where
@@ -171,6 +326,10 @@ implement! { @builder filter ['de, D: Deserializer<'de>, P] (Builder<D, (), P>) 
 }
 
 implement! { ['de, D: Deserializer<'de>, F, P, C] (Builder<D, F, P>) -> D::Error;
+    /// Deserializes `T` using the configured callbacks.
+    ///
+    /// Returns the first callback error unchanged, or the underlying
+    /// deserializer's result when no callback rejects the input.
     pub fn deserialize<T: Deserialize<'de>>(self) -> Result<T, D::Error> {
         let mut state = State {
             filter: self.filter,
