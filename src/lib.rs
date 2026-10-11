@@ -55,54 +55,151 @@ impl fmt::Display for Path<'_> {
     }
 }
 
-pub fn deserialize<'de, D, T, F>(deserializer: D, on_unknown: F) -> Result<T, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-    F: FnMut(&Path<'_>) -> Result<(), D::Error>,
-{
-    let mut state = State {
-        on_unknown,
-        error: None,
-        key: None,
-        index: 0,
+macro_rules! implement {
+    ([$($generic:tt)*] ($($header:tt)*) -> $error:ty; $($body:tt)*) => {
+        #[cfg(feature = "peek")]
+        implement! { #impl [$($generic)*] ($($header)*) where [
+            F: FnMut(&Path<'_>) -> Result<Option<C>, $error>,
+            P: FnMut(&Path<'_>, Option<C>, serde_json::Value) -> Result<(), $error>,
+        ];
+            $($body)*
+        }
+
+        #[cfg(not(feature = "peek"))]
+        implement! { #impl [$($generic)*] ($($header)*) where [
+            F: FnMut(&Path<'_>) -> Result<Option<C>, $error>,
+        ];
+            $($body)*
+        }
     };
-    let path = Path::Root;
-    let result = T::deserialize(Tracker::new(deserializer, &mut state, &path));
-    match state.error {
-        Some(error) => Err(error),
-        None => result,
-    }
+    (@builder $missing:ident [$($generic:tt)*] ($($header:tt)*) -> $error:ty;
+        $context:ty $(where [$($bound:tt)*])?
+    ) => {
+        implement! { #impl [$($generic)*] ($($header)*) $(where [$($bound)*])?;
+            pub fn deserialize<T: Deserialize<'de>>(self) -> Result<T, $error> {
+                Builder {
+                    deserializer: self.deserializer,
+                    filter: implement!(#field $missing self.filter ($context, $error)),
+                    peek: implement!(#field $missing self.peek ($context, $error)),
+                }
+                .deserialize()
+            }
+        }
+    };
+    (#impl [$($generic:tt)*] ($($header:tt)*) $(where [$($bound:tt)*])?; $($body:tt)*) => {
+        impl<$($generic)*> $($header)* $(where $($bound)*)? {
+            $($body)*
+        }
+    };
+    (#field filter $receiver:ident.filter ($context:ty, $error:ty)) => {
+        None::<fn(&Path<'_>) -> Result<Option<$context>, $error>>
+    };
+    (#field peek $receiver:ident.peek ($context:ty, $error:ty)) => {
+        None::<fn(&Path<'_>, Option<$context>, serde_json::Value) -> Result<(), $error>>
+    };
+    (#field $missing:ident $receiver:ident.$field:ident ($context:ty, $error:ty)) => {
+        $receiver.$field
+    };
 }
 
 pub trait DeserializerExt<'de>: Deserializer<'de> {
-    fn deserialize<T, F>(self, on_unknown: F) -> Result<T, Self::Error>
+    fn deserialize<T, F>(self, mut callback: F) -> Result<T, Self::Error>
     where
         T: Deserialize<'de>,
         F: FnMut(&Path<'_>) -> Result<(), Self::Error>,
     {
-        deserialize(self, on_unknown)
+        self.track()
+            .filter(move |path| callback(path).map(|()| None::<()>))
+            .deserialize()
+    }
+
+    fn track(self) -> Builder<Self> {
+        Builder {
+            deserializer: self,
+            filter: None,
+            peek: None,
+        }
     }
 }
 
 impl<'de, D: Deserializer<'de>> DeserializerExt<'de> for D {}
 
-struct State<E, F> {
-    on_unknown: F,
+#[must_use]
+pub struct Builder<D, F = (), P = ()> {
+    deserializer: D,
+    filter: Option<F>,
+    peek: Option<P>,
+}
+
+impl<D, F, P> Builder<D, F, P> {
+    pub fn filter<'de, C, Filter>(self, filter: Filter) -> Builder<D, Filter, P>
+    where
+        D: Deserializer<'de>,
+        Filter: FnMut(&Path<'_>) -> Result<Option<C>, D::Error>,
+    {
+        Builder {
+            deserializer: self.deserializer,
+            filter: Some(filter),
+            peek: self.peek,
+        }
+    }
+
+    #[cfg(feature = "peek")]
+    pub fn peek<'de, C, Peek>(self, peek: Peek) -> Builder<D, F, Peek>
+    where
+        D: Deserializer<'de>,
+        Peek: FnMut(&Path<'_>, Option<C>, serde_json::Value) -> Result<(), D::Error>,
+    {
+        Builder {
+            deserializer: self.deserializer,
+            filter: self.filter,
+            peek: Some(peek),
+        }
+    }
+}
+
+implement! { @builder filter ['de, D: Deserializer<'de>] (Builder<D>) -> D::Error; () }
+
+#[cfg(feature = "peek")]
+implement! { @builder peek ['de, D: Deserializer<'de>, F, C] (Builder<D, F>) -> D::Error;
+    C where [F: FnMut(&Path<'_>) -> Result<Option<C>, D::Error>]
+}
+
+#[cfg(feature = "peek")]
+implement! { @builder filter ['de, D: Deserializer<'de>, P] (Builder<D, (), P>) -> D::Error;
+    () where [P: FnMut(&Path<'_>, Option<()>, serde_json::Value) -> Result<(), D::Error>]
+}
+
+implement! { ['de, D: Deserializer<'de>, F, P, C] (Builder<D, F, P>) -> D::Error;
+    pub fn deserialize<T: Deserialize<'de>>(self) -> Result<T, D::Error> {
+        let mut state = State {
+            filter: self.filter,
+            peek: self.peek,
+            error: None,
+            key: None,
+            index: 0,
+        };
+        let path = Path::Root;
+        let result = T::deserialize(Tracker::new(self.deserializer, &mut state, &path));
+        state.error.map_or(result, Err)
+    }
+}
+
+struct State<E, F, P> {
+    filter: Option<F>,
+    #[cfg_attr(not(feature = "peek"), allow(dead_code))]
+    peek: Option<P>,
     error: Option<E>,
     key: Option<CompactString>,
     index: usize,
 }
 
-impl<E, F: FnMut(&Path<'_>) -> Result<(), E>> State<E, F> {
-    fn unknown<Error: de::Error>(&mut self, path: &Path<'_>) -> Result<(), Error> {
-        if self.error.is_none() {
-            match (self.on_unknown)(path) {
-                Ok(()) => return Ok(()),
-                Err(error) => self.error = Some(error),
-            }
-        }
-        Err(Error::custom("unknown field rejected"))
+impl<E, F, P> State<E, F, P> {
+    fn check<Error: de::Error, T>(&mut self, result: Result<T, E>) -> Result<T, Error> {
+        result.map_err(|error| {
+            self.error.get_or_insert(error);
+            Error::custom("unknown field rejected")
+        })
     }
 
     fn scope<T>(&mut self, visit: impl FnOnce(&mut Self) -> T) -> T {
@@ -115,11 +212,11 @@ impl<E, F: FnMut(&Path<'_>) -> Result<(), E>> State<E, F> {
 }
 
 #[derive(Constructor, Deref, DerefMut)]
-struct Tracker<'s, 'p, T, E, F> {
+struct Tracker<'s, 'p, T, E, F, P> {
     inner: T,
     #[deref(forward)]
     #[deref_mut(forward)]
-    state: &'s mut State<E, F>,
+    state: &'s mut State<E, F, P>,
     path: &'p Path<'p>,
 }
 
@@ -238,9 +335,8 @@ macro_rules! delegate {
     };
 }
 
-impl<'de, 's, 'p, D: Deserializer<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> Deserializer<'de>
-    for Tracker<'s, 'p, D, E, F>
-{
+implement! { ['de, 's, 'p, D: Deserializer<'de>, E, F, P, C]
+    (Deserializer<'de> for Tracker<'s, 'p, D, E, F, P>) -> E;
     type Error = D::Error;
 
     delegate! { @de
@@ -265,7 +361,28 @@ impl<'de, 's, 'p, D: Deserializer<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>>
     }
 
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        self.state.unknown(self.path)?;
+        if self.state.error.is_some() {
+            return Err(de::Error::custom("unknown field rejected"));
+        }
+        let context = match self.state.filter.as_mut() {
+            Some(filter) => {
+                let result = filter(self.path);
+                match self.state.check(result)? {
+                    Some(context) => Some(context),
+                    None => return self.inner.deserialize_ignored_any(visitor),
+                }
+            }
+            None => None,
+        };
+        #[cfg(feature = "peek")]
+        if let Some(peek) = self.state.peek.as_mut() {
+            let value = <serde_json::Value as Deserialize>::deserialize(self.inner)?;
+            let result = peek(self.path, context, value);
+            self.state.check(result)?;
+            return visitor.visit_unit();
+        }
+        #[cfg(not(feature = "peek"))]
+        let _ = context;
         self.inner.deserialize_ignored_any(visitor)
     }
 
@@ -274,9 +391,8 @@ impl<'de, 's, 'p, D: Deserializer<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>>
     }
 }
 
-impl<'de, 's, 'p, V: Visitor<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> Visitor<'de>
-    for Tracker<'s, 'p, V, E, F>
-{
+implement! { ['de, 's, 'p, V: Visitor<'de>, E, F, P, C]
+    (Visitor<'de> for Tracker<'s, 'p, V, E, F, P>) -> E;
     type Value = V::Value;
     delegate! { @plain
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result;
@@ -377,18 +493,16 @@ impl<'de, S: DeserializeSeed<'de>> Visitor<'de> for Field<'_, S> {
     }
 }
 
-impl<'de, 's, 'p, S: DeserializeSeed<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>>
-    DeserializeSeed<'de> for Tracker<'s, 'p, S, E, F>
-{
+implement! { ['de, 's, 'p, S: DeserializeSeed<'de>, E, F, P, C]
+    (DeserializeSeed<'de> for Tracker<'s, 'p, S, E, F, P>) -> E;
     type Value = S::Value;
     delegate! { @wrap
         fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error>;
     }
 }
 
-impl<'de, 's, 'p, A: SeqAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> SeqAccess<'de>
-    for Tracker<'s, 'p, A, E, F>
-{
+implement! { ['de, 's, 'p, A: SeqAccess<'de>, E, F, P, C]
+    (SeqAccess<'de> for Tracker<'s, 'p, A, E, F, P>) -> E;
     type Error = A::Error;
     fn next_element_seed<S: DeserializeSeed<'de>>(
         &mut self,
@@ -408,9 +522,8 @@ impl<'de, 's, 'p, A: SeqAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> Se
     }
 }
 
-impl<'de, 's, 'p, A: MapAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> MapAccess<'de>
-    for Tracker<'s, 'p, A, E, F>
-{
+implement! { ['de, 's, 'p, A: MapAccess<'de>, E, F, P, C]
+    (MapAccess<'de> for Tracker<'s, 'p, A, E, F, P>) -> E;
     type Error = A::Error;
     fn next_key_seed<K: DeserializeSeed<'de>>(
         &mut self,
@@ -434,11 +547,10 @@ impl<'de, 's, 'p, A: MapAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> Ma
     }
 }
 
-impl<'de, 's, 'p, A: EnumAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> EnumAccess<'de>
-    for Tracker<'s, 'p, A, E, F>
-{
+implement! { ['de, 's, 'p, A: EnumAccess<'de>, E, F, P, C]
+    (EnumAccess<'de> for Tracker<'s, 'p, A, E, F, P>) -> E;
     type Error = A::Error;
-    type Variant = Tracker<'s, 'p, A::Variant, E, F>;
+    type Variant = Tracker<'s, 'p, A::Variant, E, F, P>;
     fn variant_seed<V: DeserializeSeed<'de>>(
         self,
         seed: V,
@@ -448,9 +560,8 @@ impl<'de, 's, 'p, A: EnumAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> E
     }
 }
 
-impl<'de, 's, 'p, A: VariantAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> VariantAccess<'de>
-    for Tracker<'s, 'p, A, E, F>
-{
+implement! { ['de, 's, 'p, A: VariantAccess<'de>, E, F, P, C]
+    (VariantAccess<'de> for Tracker<'s, 'p, A, E, F, P>) -> E;
     type Error = A::Error;
     delegate! { @plain
         fn unit_variant(self) -> Result<(), Self::Error>;

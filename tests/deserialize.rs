@@ -1,7 +1,7 @@
 use compact_str::CompactString;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use serde_unknown::{DeserializerExt, Path, deserialize};
+use serde_unknown::{DeserializerExt, Path};
 #[cfg(not(feature = "std"))]
 use std::collections::BTreeMap as Map;
 #[cfg(feature = "std")]
@@ -122,11 +122,12 @@ where
 {
     let mut unknown = Vec::new();
     let mut deserializer = serde_json::Deserializer::from_str(json);
-    let value: T = deserialize(&mut deserializer, |path| {
-        unknown.push(path.to_string());
-        Ok(())
-    })
-    .unwrap();
+    let value: T = (&mut deserializer)
+        .deserialize(|path| {
+            unknown.push(path.to_string());
+            Ok(())
+        })
+        .unwrap();
     deserializer.end().unwrap();
     let plain: T = serde_json::from_str(json).unwrap();
     assert_eq!(value, plain, "wrapper must not change the result");
@@ -193,11 +194,12 @@ fn strict_structs_filter_unknown_fields_without_filtering_map_keys() {
 
     let mut unknown = Vec::new();
     let mut deserializer = serde_json::Deserializer::from_str(json);
-    let value: Strict = deserialize(&mut deserializer, |path| {
-        unknown.push(path.to_string());
-        Ok(())
-    })
-    .unwrap();
+    let value: Strict = (&mut deserializer)
+        .deserialize(|path| {
+            unknown.push(path.to_string());
+            Ok(())
+        })
+        .unwrap();
     deserializer.end().unwrap();
 
     assert_eq!(value.name, "root");
@@ -226,11 +228,12 @@ fn empty_structs_report_all_fields() {
 
     let mut unknown = Vec::new();
     let mut deserializer = serde_json::Deserializer::from_str(json);
-    let _: Empty = deserialize(&mut deserializer, |path| {
-        unknown.push(path.to_string());
-        Ok(())
-    })
-    .unwrap();
+    let _: Empty = (&mut deserializer)
+        .deserialize(|path| {
+            unknown.push(path.to_string());
+            Ok(())
+        })
+        .unwrap();
     deserializer.end().unwrap();
     assert_eq!(unknown, ["first", "second"]);
 }
@@ -246,11 +249,12 @@ fn structs_still_accept_sequences() {
 fn struct_field_indices_and_bytes_are_forwarded() {
     fn check<'de, D: Deserializer<'de>>(deserializer: D) {
         let mut unknown = Vec::new();
-        let value: Inner = deserialize(deserializer, |path| {
-            unknown.push(path.to_string());
-            Ok(())
-        })
-        .unwrap();
+        let value: Inner = deserializer
+            .deserialize(|path| {
+                unknown.push(path.to_string());
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(value.name, "name");
         assert!(unknown.is_empty());
     }
@@ -363,11 +367,12 @@ fn compound_map_keys_do_not_capture_their_contents() {
     ];
     let mut unknown = Vec::new();
     let deserializer = MapDeserializer::<_, serde_json::Error>::new(entries.into_iter());
-    let values: BTreeMap<Key, Inner> = deserialize(deserializer, |path| {
-        unknown.push(path.to_string());
-        Ok(())
-    })
-    .unwrap();
+    let values: BTreeMap<Key, Inner> = deserializer
+        .deserialize(|path| {
+            unknown.push(path.to_string());
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(values.len(), 3);
     assert_eq!(
         unknown,
@@ -424,11 +429,12 @@ fn borrowed_strings_stay_zero_copy() {
     let json = r#"{"text": "hello", "cow_text": "world", "unknown": 1}"#;
     let mut unknown = Vec::new();
     let mut deserializer = serde_json::Deserializer::from_str(json);
-    let borrowed: BorrowedStrings = deserialize(&mut deserializer, |path| {
-        unknown.push(path.to_string());
-        Ok(())
-    })
-    .unwrap();
+    let borrowed: BorrowedStrings = (&mut deserializer)
+        .deserialize(|path| {
+            unknown.push(path.to_string());
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(borrowed.text, "hello");
     assert!(matches!(borrowed.cow_text, Cow::Borrowed("world")));
     assert_eq!(unknown, ["unknown"]);
@@ -437,7 +443,7 @@ fn borrowed_strings_stay_zero_copy() {
 #[test]
 fn errors_still_propagate() {
     let mut deserializer = serde_json::Deserializer::from_str(r#"{"title": 1}"#);
-    let result: Result<Outer, _> = deserialize(&mut deserializer, |_| Ok(()));
+    let result: Result<Outer, _> = (&mut deserializer).deserialize(|_| Ok(()));
     assert!(result.is_err());
 }
 
@@ -460,6 +466,56 @@ fn callback_errors_stop_before_unknown_values_are_consumed() {
 
     assert_eq!(result.unwrap_err().to_string(), "blocked field");
     assert_eq!(unknown, ["[0].allowed", "[1].blocked"]);
+}
+
+#[test]
+fn builder_without_callbacks_accepts_unknown_fields() {
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Strict {
+        name: String,
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(r#"{"name":"a","unknown":1e400}"#);
+    let value: Strict = (&mut deserializer).track().deserialize().unwrap();
+
+    assert_eq!(value.name, "a");
+    deserializer.end().unwrap();
+}
+
+#[test]
+fn filter_without_peek_does_not_materialize_selected_values() {
+    let mut deserializer = serde_json::Deserializer::from_str(r#"{"name":"a","unknown":1e400}"#);
+    let mut paths = Vec::new();
+    let value: Inner = (&mut deserializer)
+        .track()
+        .filter(|path| {
+            paths.push(path.to_string());
+            Ok(Some(()))
+        })
+        .deserialize()
+        .unwrap();
+
+    assert_eq!(value.name, "a");
+    assert_eq!(paths, ["unknown"]);
+    deserializer.end().unwrap();
+}
+
+#[test]
+fn filter_errors_stop_before_values_are_consumed() {
+    let mut deserializer = serde_json::Deserializer::from_str(r#"{"blocked":invalid,"later":0}"#);
+    let mut callbacks = 0;
+    let result: Result<Inner, _> = (&mut deserializer)
+        .track()
+        .filter(|path| {
+            callbacks += 1;
+            assert!(path.matches(&["<root>", "blocked"]));
+            Err::<Option<()>, _>(de::Error::custom("blocked field"))
+        })
+        .deserialize();
+
+    assert_eq!(result.unwrap_err().to_string(), "blocked field");
+    assert_eq!(callbacks, 1);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -489,7 +545,7 @@ impl de::Error for Failure {
 fn callback_errors_preserve_the_original_error() {
     let deserializer =
         de::value::MapDeserializer::<_, Failure>::new([("unknown", 0u8)].into_iter());
-    let result: Result<Inner, _> = deserialize(deserializer, |_| Err(Failure::Callback(7)));
+    let result: Result<Inner, _> = deserializer.deserialize(|_| Err(Failure::Callback(7)));
 
     assert_eq!(result.unwrap_err(), Failure::Callback(7));
 }
@@ -515,12 +571,59 @@ impl<'de, D: Deserializer<'de>> Deserializer<'de> for Nested<D> {
 #[test]
 fn callback_errors_cross_different_deserializer_error_types() {
     let mut deserializer = serde_json::Deserializer::from_str(r#"{"unknown":0}"#);
-    let result: Result<Option<Inner>, _> = deserialize(Nested(&mut deserializer), |path| {
+    let result: Result<Option<Inner>, _> = Nested(&mut deserializer).deserialize(|path| {
         assert!(path.matches(&["<root>", "unknown"]));
         Err(Failure::Callback(9))
     });
 
     assert_eq!(result.unwrap_err(), Failure::Callback(9));
+}
+
+#[test]
+fn filter_errors_cross_different_deserializer_error_types() {
+    let mut deserializer = serde_json::Deserializer::from_str(r#"{"unknown":invalid}"#);
+    let result: Result<Option<Inner>, _> = Nested(&mut deserializer)
+        .track()
+        .filter(|path| {
+            assert!(path.matches(&["<root>", "unknown"]));
+            Err::<Option<()>, _>(Failure::Callback(11))
+        })
+        .deserialize();
+
+    assert_eq!(result.unwrap_err(), Failure::Callback(11));
+}
+
+#[cfg(feature = "peek")]
+#[test]
+fn peek_errors_preserve_the_original_error() {
+    let deserializer =
+        de::value::MapDeserializer::<_, Failure>::new([("unknown", 0u8)].into_iter());
+    let result: Result<Inner, _> = deserializer
+        .track()
+        .peek(|path, _, value| {
+            assert!(path.matches(&["<root>", "unknown"]));
+            assert_eq!(value, serde_json::json!(0));
+            Err(Failure::Callback(13))
+        })
+        .deserialize();
+
+    assert_eq!(result.unwrap_err(), Failure::Callback(13));
+}
+
+#[cfg(feature = "peek")]
+#[test]
+fn peek_errors_cross_different_deserializer_error_types() {
+    let mut deserializer = serde_json::Deserializer::from_str(r#"{"unknown":0}"#);
+    let result: Result<Option<Inner>, _> = Nested(&mut deserializer)
+        .track()
+        .peek(|path, _, value| {
+            assert!(path.matches(&["<root>", "unknown"]));
+            assert_eq!(value, serde_json::json!(0));
+            Err(Failure::Callback(15))
+        })
+        .deserialize();
+
+    assert_eq!(result.unwrap_err(), Failure::Callback(15));
 }
 
 #[test]
@@ -555,11 +658,35 @@ fn caught_errors_do_not_resume_callbacks_or_replace_the_first_error() {
         [("first", 0u8), ("second", 1u8)].into_iter(),
     );
     let mut callbacks = 0;
-    let result: Result<Recovery, _> = deserialize(deserializer, |_| {
+    let result: Result<Recovery, _> = deserializer.deserialize(|_| {
         callbacks += 1;
         Err(Failure::Callback(callbacks))
     });
 
     assert_eq!(result.unwrap_err(), Failure::Callback(1));
     assert_eq!(callbacks, 1);
+
+    #[cfg(feature = "peek")]
+    {
+        let deserializer = de::value::MapDeserializer::<_, Failure>::new(
+            [("first", 0u8), ("second", 1u8)].into_iter(),
+        );
+        let mut filters = 0;
+        let mut peeks = 0;
+        let result: Result<Recovery, _> = deserializer
+            .track()
+            .filter(|_| {
+                filters += 1;
+                Ok(Some(()))
+            })
+            .peek(|_, _, _| {
+                peeks += 1;
+                Err(Failure::Callback(2))
+            })
+            .deserialize();
+
+        assert_eq!(result.unwrap_err(), Failure::Callback(2));
+        assert_eq!(filters, 1);
+        assert_eq!(peeks, 1);
+    }
 }
