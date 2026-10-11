@@ -32,3 +32,16 @@ fn main() -> Result<(), serde_json::Error> {
 Paths use a stack-linked list. Keys use `CompactString`, so short keys stay inline
 while long keys may allocate. Invalid values and duplicate fields still return
 errors. Map keys are unrestricted. Flattened fields are not tracked.
+
+## Features
+
+The `std` feature is enabled by default. Disable default features to use
+`serde-unknown` in a `no_std` environment:
+
+```toml
+serde-unknown = { version = "0.1", default-features = false }
+```
+
+This configuration still requires `alloc` and an allocator in the final
+application. Short keys stay inline; long keys may allocate. `Path` implements
+`Display` and `Debug` with or without `std`.

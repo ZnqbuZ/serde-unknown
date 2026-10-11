@@ -1,11 +1,17 @@
+#![cfg_attr(not(feature = "std"), no_std)]
 #![doc = include_str!("../README.md")]
 
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+
+use alloc::{string::String, vec::Vec};
 use compact_str::{CompactString, format_compact};
+use core::fmt;
 use derive_more::{Constructor, Deref, DerefMut};
 use pastey::paste;
 use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
 use serde::{Deserialize, Deserializer};
-use std::fmt;
 
 #[derive(Debug)]
 pub enum Path<'p> {
@@ -416,9 +422,14 @@ impl<'de, 's, 'p, A: VariantAccess<'de>, F: FnMut(&Path<'_>)> VariantAccess<'de>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::borrow::Cow;
+    use alloc::collections::BTreeMap;
+    #[cfg(not(feature = "std"))]
+    use alloc::collections::BTreeMap as Map;
+    use alloc::string::ToString;
     use serde::Deserialize;
-    use std::borrow::Cow;
-    use std::collections::{BTreeMap, HashMap};
+    #[cfg(feature = "std")]
+    use std::collections::HashMap as Map;
 
     #[test]
     fn paths_display_root_keys_and_indices() {
@@ -465,7 +476,7 @@ mod tests {
         title: String,
         inner: Option<Inner>,
         items: Vec<Inner>,
-        by_name: HashMap<String, Inner>,
+        by_name: Map<String, Inner>,
         by_id: BTreeMap<u32, Inner>,
         len: Meters,
         kind: Kind,

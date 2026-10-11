@@ -6,12 +6,16 @@ description = "Handle unknown fields during Serde deserialization."
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
+[features]
+default = ["std"]
+std = ["compact_str/std", "derive_more/std", "serde/std"]
+
 [dependencies]
-compact_str = "0.10.0"
-derive_more = { version = "2.1.1", features = ["constructor", "deref", "deref_mut"] }
+compact_str = { version = "0.10.0", default-features = false }
+derive_more = { version = "2.1.1", default-features = false, features = ["constructor", "deref", "deref_mut"] }
 pastey = "0.2"
-serde = "1.0.229"
+serde = { version = "1.0.229", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
