@@ -371,6 +371,7 @@ impl<E, F, P> State<E, F, P> {
 }
 
 #[derive(Constructor, Deref, DerefMut)]
+#[allow(clippy::redundant_field_names, reason = "rust-lang/rust-clippy#17525")]
 struct Tracker<'s, 'p, T, E, F, P> {
     inner: T,
     #[deref(forward)]
@@ -380,12 +381,14 @@ struct Tracker<'s, 'p, T, E, F, P> {
 }
 
 #[derive(Constructor)]
+#[allow(clippy::redundant_field_names, reason = "rust-lang/rust-clippy#17525")]
 struct Struct<T> {
     inner: T,
     fields: &'static [&'static str],
 }
 
 #[derive(Constructor)]
+#[allow(clippy::redundant_field_names, reason = "rust-lang/rust-clippy#17525")]
 struct Field<'f, S> {
     inner: &'f mut Option<S>,
     fields: &'static [&'static str],
