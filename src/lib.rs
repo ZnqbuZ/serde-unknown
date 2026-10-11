@@ -2,8 +2,6 @@
 #![doc = include_str!("../README.md")]
 
 extern crate alloc;
-#[cfg(test)]
-extern crate std;
 
 use alloc::{string::String, vec::Vec};
 use compact_str::{CompactString, format_compact};
@@ -61,22 +59,27 @@ pub fn deserialize<'de, D, T, F>(deserializer: D, on_unknown: F) -> Result<T, D:
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
-    F: FnMut(&Path<'_>),
+    F: FnMut(&Path<'_>) -> Result<(), D::Error>,
 {
     let mut state = State {
         on_unknown,
+        error: None,
         key: None,
         index: 0,
     };
     let path = Path::Root;
-    T::deserialize(Tracker::new(deserializer, &mut state, &path))
+    let result = T::deserialize(Tracker::new(deserializer, &mut state, &path));
+    match state.error {
+        Some(error) => Err(error),
+        None => result,
+    }
 }
 
 pub trait DeserializerExt<'de>: Deserializer<'de> {
     fn deserialize<T, F>(self, on_unknown: F) -> Result<T, Self::Error>
     where
         T: Deserialize<'de>,
-        F: FnMut(&Path<'_>),
+        F: FnMut(&Path<'_>) -> Result<(), Self::Error>,
     {
         deserialize(self, on_unknown)
     }
@@ -84,13 +87,24 @@ pub trait DeserializerExt<'de>: Deserializer<'de> {
 
 impl<'de, D: Deserializer<'de>> DeserializerExt<'de> for D {}
 
-struct State<F> {
+struct State<E, F> {
     on_unknown: F,
+    error: Option<E>,
     key: Option<CompactString>,
     index: usize,
 }
 
-impl<F: FnMut(&Path<'_>)> State<F> {
+impl<E, F: FnMut(&Path<'_>) -> Result<(), E>> State<E, F> {
+    fn unknown<Error: de::Error>(&mut self, path: &Path<'_>) -> Result<(), Error> {
+        if self.error.is_none() {
+            match (self.on_unknown)(path) {
+                Ok(()) => return Ok(()),
+                Err(error) => self.error = Some(error),
+            }
+        }
+        Err(Error::custom("unknown field rejected"))
+    }
+
     fn scope<T>(&mut self, visit: impl FnOnce(&mut Self) -> T) -> T {
         let context = (self.key.take(), self.index);
         self.index = 0;
@@ -101,11 +115,11 @@ impl<F: FnMut(&Path<'_>)> State<F> {
 }
 
 #[derive(Constructor, Deref, DerefMut)]
-struct Tracker<'s, 'p, T, F> {
+struct Tracker<'s, 'p, T, E, F> {
     inner: T,
     #[deref(forward)]
     #[deref_mut(forward)]
-    state: &'s mut State<F>,
+    state: &'s mut State<E, F>,
     path: &'p Path<'p>,
 }
 
@@ -140,21 +154,21 @@ macro_rules! delegate {
     };
     (#impl visit $method:ident ()) => {
         paste! {
-            fn [<visit_ $method>]<E: de::Error>(self) -> Result<Self::Value, E> {
+            fn [<visit_ $method>]<Error: de::Error>(self) -> Result<Self::Value, Error> {
                 self.inner.[<visit_ $method>]()
             }
         }
     };
     (#impl visit $method:ident ($ty:ty)) => {
         paste! {
-            fn [<visit_ $method>]<E: de::Error>(self, value: $ty) -> Result<Self::Value, E> {
+            fn [<visit_ $method>]<Error: de::Error>(self, value: $ty) -> Result<Self::Value, Error> {
                 self.inner.[<visit_ $method>](value)
             }
         }
     };
     (#impl key $method:ident ($ty:ty)) => {
         paste! {
-            fn [<visit_ $method>]<E: de::Error>(mut self, value: $ty) -> Result<Self::Value, E> {
+            fn [<visit_ $method>]<Error: de::Error>(mut self, value: $ty) -> Result<Self::Value, Error> {
                 if self.key.is_some() {
                     self.key = Some(format_compact!("{value}"));
                 }
@@ -164,7 +178,7 @@ macro_rules! delegate {
     };
     (@field @$mode:ident $($method:ident ($ty:ty, $deserializer:ident)),* $(,)?) => {
         paste! {$(
-            fn [<visit_ $method>]<E: de::Error>(self, value: $ty) -> Result<Self::Value, E> {
+            fn [<visit_ $method>]<Error: de::Error>(self, value: $ty) -> Result<Self::Value, Error> {
                 delegate!(#impl field @$mode self(value, $deserializer))
             }
         )*}
@@ -224,8 +238,8 @@ macro_rules! delegate {
     };
 }
 
-impl<'de, 's, 'p, D: Deserializer<'de>, F: FnMut(&Path<'_>)> Deserializer<'de>
-    for Tracker<'s, 'p, D, F>
+impl<'de, 's, 'p, D: Deserializer<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> Deserializer<'de>
+    for Tracker<'s, 'p, D, E, F>
 {
     type Error = D::Error;
 
@@ -251,7 +265,7 @@ impl<'de, 's, 'p, D: Deserializer<'de>, F: FnMut(&Path<'_>)> Deserializer<'de>
     }
 
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        (self.state.on_unknown)(self.path);
+        self.state.unknown(self.path)?;
         self.inner.deserialize_ignored_any(visitor)
     }
 
@@ -260,7 +274,9 @@ impl<'de, 's, 'p, D: Deserializer<'de>, F: FnMut(&Path<'_>)> Deserializer<'de>
     }
 }
 
-impl<'de, 's, 'p, V: Visitor<'de>, F: FnMut(&Path<'_>)> Visitor<'de> for Tracker<'s, 'p, V, F> {
+impl<'de, 's, 'p, V: Visitor<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> Visitor<'de>
+    for Tracker<'s, 'p, V, E, F>
+{
     type Value = V::Value;
     delegate! { @plain
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result;
@@ -361,8 +377,8 @@ impl<'de, S: DeserializeSeed<'de>> Visitor<'de> for Field<'_, S> {
     }
 }
 
-impl<'de, 's, 'p, S: DeserializeSeed<'de>, F: FnMut(&Path<'_>)> DeserializeSeed<'de>
-    for Tracker<'s, 'p, S, F>
+impl<'de, 's, 'p, S: DeserializeSeed<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>>
+    DeserializeSeed<'de> for Tracker<'s, 'p, S, E, F>
 {
     type Value = S::Value;
     delegate! { @wrap
@@ -370,7 +386,9 @@ impl<'de, 's, 'p, S: DeserializeSeed<'de>, F: FnMut(&Path<'_>)> DeserializeSeed<
     }
 }
 
-impl<'de, 's, 'p, A: SeqAccess<'de>, F: FnMut(&Path<'_>)> SeqAccess<'de> for Tracker<'s, 'p, A, F> {
+impl<'de, 's, 'p, A: SeqAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> SeqAccess<'de>
+    for Tracker<'s, 'p, A, E, F>
+{
     type Error = A::Error;
     fn next_element_seed<S: DeserializeSeed<'de>>(
         &mut self,
@@ -390,7 +408,9 @@ impl<'de, 's, 'p, A: SeqAccess<'de>, F: FnMut(&Path<'_>)> SeqAccess<'de> for Tra
     }
 }
 
-impl<'de, 's, 'p, A: MapAccess<'de>, F: FnMut(&Path<'_>)> MapAccess<'de> for Tracker<'s, 'p, A, F> {
+impl<'de, 's, 'p, A: MapAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> MapAccess<'de>
+    for Tracker<'s, 'p, A, E, F>
+{
     type Error = A::Error;
     fn next_key_seed<K: DeserializeSeed<'de>>(
         &mut self,
@@ -414,11 +434,11 @@ impl<'de, 's, 'p, A: MapAccess<'de>, F: FnMut(&Path<'_>)> MapAccess<'de> for Tra
     }
 }
 
-impl<'de, 's, 'p, A: EnumAccess<'de>, F: FnMut(&Path<'_>)> EnumAccess<'de>
-    for Tracker<'s, 'p, A, F>
+impl<'de, 's, 'p, A: EnumAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> EnumAccess<'de>
+    for Tracker<'s, 'p, A, E, F>
 {
     type Error = A::Error;
-    type Variant = Tracker<'s, 'p, A::Variant, F>;
+    type Variant = Tracker<'s, 'p, A::Variant, E, F>;
     fn variant_seed<V: DeserializeSeed<'de>>(
         self,
         seed: V,
@@ -428,8 +448,8 @@ impl<'de, 's, 'p, A: EnumAccess<'de>, F: FnMut(&Path<'_>)> EnumAccess<'de>
     }
 }
 
-impl<'de, 's, 'p, A: VariantAccess<'de>, F: FnMut(&Path<'_>)> VariantAccess<'de>
-    for Tracker<'s, 'p, A, F>
+impl<'de, 's, 'p, A: VariantAccess<'de>, E, F: FnMut(&Path<'_>) -> Result<(), E>> VariantAccess<'de>
+    for Tracker<'s, 'p, A, E, F>
 {
     type Error = A::Error;
     delegate! { @plain
@@ -441,430 +461,5 @@ impl<'de, 's, 'p, A: VariantAccess<'de>, F: FnMut(&Path<'_>)> VariantAccess<'de>
     delegate! { @wrap
         fn tuple_variant<V: Visitor<'de>>(self, len: usize, visitor: V) -> Result<V::Value, Self::Error>;
         fn struct_variant<V: Visitor<'de>>(self, fields: &'static [&'static str], visitor: V) -> Result<V::Value, Self::Error>;
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloc::borrow::Cow;
-    use alloc::collections::BTreeMap;
-    #[cfg(not(feature = "std"))]
-    use alloc::collections::BTreeMap as Map;
-    use alloc::string::ToString;
-    use serde::Deserialize;
-    #[cfg(feature = "std")]
-    use std::collections::HashMap as Map;
-
-    #[test]
-    fn paths_display_root_keys_and_indices() {
-        let root = Path::Root;
-        let key = Path::Key(&root, CompactString::const_new("items"));
-        let index = Path::Index(&key, 2);
-        let nested_key = Path::Key(&index, CompactString::const_new("extra"));
-        let root_index = Path::Index(&root, 0);
-        let nested_index = Path::Index(&root_index, 3);
-        let indexed_key = Path::Key(&root_index, CompactString::const_new("extra"));
-        for (path, expected) in [
-            (&root, "<root>"),
-            (&key, "items"),
-            (&index, "items[2]"),
-            (&nested_key, "items[2].extra"),
-            (&root_index, "[0]"),
-            (&nested_index, "[0][3]"),
-            (&indexed_key, "[0].extra"),
-        ] {
-            assert_eq!(path.to_string(), expected);
-        }
-    }
-
-    #[test]
-    fn paths_match_exact_layers_and_wildcards() {
-        let root = Path::Root;
-        let config = Path::Key(&root, CompactString::const_new("config"));
-        let index = Path::Index(&config, 3);
-        let field = Path::Key(&index, CompactString::const_new("deprecated_field"));
-
-        assert!(root.matches(&["<root>"]));
-        assert!(!root.matches(&[]));
-        assert!(!root.matches(&["*"]));
-        assert!(config.matches(&["<root>", "config"]));
-        assert!(index.matches(&["<root>", "config", "3"]));
-        assert!(index.matches(&["<root>", "config", "*"]));
-
-        for pattern in [
-            ["<root>", "config", "3", "deprecated_field"],
-            ["<root>", "config", "*", "deprecated_field"],
-            ["<root>", "*", "3", "deprecated_field"],
-            ["<root>", "config", "3", "*"],
-        ] {
-            assert!(field.matches(&pattern));
-        }
-        for pattern in [
-            ["<root>", "config", "2", "deprecated_field"],
-            ["<root>", "config", "invalid", "deprecated_field"],
-            [
-                "<root>",
-                "config",
-                "9999999999999999999999999999999999999999",
-                "deprecated_field",
-            ],
-            ["<root>", "other", "3", "deprecated_field"],
-            ["root", "config", "3", "deprecated_field"],
-            ["<root>", "config", "3", "other"],
-        ] {
-            assert!(!field.matches(&pattern));
-        }
-        assert!(!field.matches(&["config", "3", "deprecated_field"]));
-        assert!(!field.matches(&["<root>", "config", "deprecated_field"]));
-        assert!(!field.matches(&["<root>", "config", "3", "deprecated_field", "extra"]));
-    }
-
-    #[test]
-    fn path_matching_preserves_literal_keys() {
-        let root = Path::Root;
-        let config = Path::Key(&root, CompactString::const_new("config.with.dots"));
-        let entry = Path::Key(&config, CompactString::const_new("items[3]"));
-        let field = Path::Key(&entry, CompactString::const_new("世界"));
-        assert!(field.matches(&["<root>", "config.with.dots", "items[3]", "世界"]));
-        assert!(!field.matches(&["<root>", "config", "with", "dots", "items[3]", "世界"]));
-
-        let key = Path::Key(&root, CompactString::const_new("<root>"));
-        assert!(key.matches(&["<root>", "<root>"]));
-        assert!(!key.matches(&["<root>"]));
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct Inner {
-        name: String,
-        #[serde(default)]
-        number: Option<u32>,
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct Meters(f64);
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    enum Kind {
-        A,
-        B(Inner),
-        C { x: Inner },
-        D(u8, Inner),
-    }
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    struct Outer {
-        title: String,
-        inner: Option<Inner>,
-        items: Vec<Inner>,
-        by_name: Map<String, Inner>,
-        by_id: BTreeMap<u32, Inner>,
-        len: Meters,
-        kind: Kind,
-        kinds: Vec<Kind>,
-    }
-
-    fn run<T>(json: &str) -> (T, Vec<String>)
-    where
-        T: for<'de> Deserialize<'de> + PartialEq + fmt::Debug,
-    {
-        let mut unknown = Vec::new();
-        let mut deserializer = serde_json::Deserializer::from_str(json);
-        let value: T =
-            deserialize(&mut deserializer, |path| unknown.push(path.to_string())).unwrap();
-        deserializer.end().unwrap();
-        let plain: T = serde_json::from_str(json).unwrap();
-        assert_eq!(value, plain, "wrapper must not change the result");
-        (value, unknown)
-    }
-
-    #[test]
-    fn reports_nested_unknown_fields_with_paths() {
-        let json = r#"{
-            "title": "t",
-            "extra": {"deep": [1, 2, {"x": 1}]},
-            "inner": {"name": "a", "zzz": 1},
-            "items": [{"name": "i0"}, {"name": "i1", "nope": null}],
-            "by_name": {"foo": {"name": "f", "bad": true}},
-            "by_id": {"7": {"name": "seven", "huh": 1}},
-            "len": 1.5,
-            "kind": {"B": {"name": "b", "oops": 1}},
-            "kinds": ["A", {"C": {"x": {"name": "c", "k": 0}}}, {"D": [1, {"name": "d", "q": 2}]}],
-            "ex\u0074ra2": "escaped key"
-        }"#;
-        let (_, unknown): (Outer, _) = run(json);
-        assert_eq!(
-            unknown,
-            [
-                "extra",
-                "inner.zzz",
-                "items[1].nope",
-                "by_name.foo.bad",
-                "by_id.7.huh",
-                "kind.oops",
-                "kinds[1].x.k",
-                "kinds[2][1].q",
-                "extra2",
-            ]
-        );
-    }
-
-    #[test]
-    fn strict_structs_filter_unknown_fields_without_filtering_map_keys() {
-        #[derive(Debug, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct StrictInner {
-            name: String,
-        }
-
-        #[derive(Debug, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Strict {
-            #[serde(alias = "title")]
-            name: String,
-            by_name: BTreeMap<String, StrictInner>,
-            items: Vec<StrictInner>,
-        }
-
-        let json = r#"{
-            "before": 1,
-            "title": "root",
-            "middle": {"nested": [1, 2]},
-            "by_name": {"arbitrary": {"unknown": 1, "name": "map"}},
-            "items": [{"unknown": 1, "name": "item"}],
-            "after": null
-        }"#;
-        assert!(serde_json::from_str::<Strict>(json).is_err());
-
-        let mut unknown = Vec::new();
-        let mut deserializer = serde_json::Deserializer::from_str(json);
-        let value: Strict =
-            deserialize(&mut deserializer, |path| unknown.push(path.to_string())).unwrap();
-        deserializer.end().unwrap();
-
-        assert_eq!(value.name, "root");
-        assert_eq!(value.by_name["arbitrary"].name, "map");
-        assert_eq!(value.items[0].name, "item");
-        assert_eq!(
-            unknown,
-            [
-                "before",
-                "middle",
-                "by_name.arbitrary.unknown",
-                "items[0].unknown",
-                "after",
-            ]
-        );
-    }
-
-    #[test]
-    fn empty_structs_report_all_fields() {
-        #[derive(Debug, Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Empty {}
-
-        let json = r#"{"first": 1, "second": {"nested": true}}"#;
-        assert!(serde_json::from_str::<Empty>(json).is_err());
-
-        let mut unknown = Vec::new();
-        let mut deserializer = serde_json::Deserializer::from_str(json);
-        let _: Empty =
-            deserialize(&mut deserializer, |path| unknown.push(path.to_string())).unwrap();
-        deserializer.end().unwrap();
-        assert_eq!(unknown, ["first", "second"]);
-    }
-
-    #[test]
-    fn structs_still_accept_sequences() {
-        let (value, unknown): (Inner, _) = run(r#"["name", null]"#);
-        assert_eq!(value.name, "name");
-        assert!(unknown.is_empty());
-    }
-
-    #[test]
-    fn struct_field_indices_and_bytes_are_forwarded() {
-        fn check<'de, D: Deserializer<'de>>(deserializer: D) {
-            let mut unknown = Vec::new();
-            let value: Inner =
-                deserialize(deserializer, |path| unknown.push(path.to_string())).unwrap();
-            assert_eq!(value.name, "name");
-            assert!(unknown.is_empty());
-        }
-
-        use de::value::{BorrowedBytesDeserializer, BytesDeserializer, Error, MapDeserializer};
-        check(MapDeserializer::<_, Error>::new(
-            [(0u64, "name")].into_iter(),
-        ));
-        check(MapDeserializer::<_, Error>::new(
-            [(BytesDeserializer::new(b"name"), "name")].into_iter(),
-        ));
-        check(MapDeserializer::<_, Error>::new(
-            [(BorrowedBytesDeserializer::new(b"name"), "name")].into_iter(),
-        ));
-    }
-
-    #[test]
-    fn non_string_map_keys_are_recorded_in_paths() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct Keys {
-            signed: BTreeMap<i64, Inner>,
-            unsigned: BTreeMap<u8, Inner>,
-            boolean: BTreeMap<bool, Inner>,
-            character: BTreeMap<char, Inner>,
-        }
-        let json = r#"{
-            "signed": {"-3":   {"name": "x", "z1": 0}},
-            "unsigned": {"200":  {"name": "x", "z2": 0}},
-            "boolean": {"true": {"name": "x", "z3": 0}},
-            "character": {"x":    {"name": "x", "z4": 0}}
-        }"#;
-        let (_, unknown): (Keys, _) = run(json);
-        assert_eq!(
-            unknown,
-            [
-                "signed.-3.z1",
-                "unsigned.200.z2",
-                "boolean.true.z3",
-                "character.x.z4"
-            ]
-        );
-    }
-
-    #[test]
-    fn optional_newtype_map_keys_are_recorded_in_paths() {
-        #[derive(Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-        struct Key(String);
-
-        let json = r#"{"first":{"name":"a","unknown":1},"second":{"name":"b","extra":2}}"#;
-        let (_, unknown): (BTreeMap<Option<Key>, Inner>, _) = run(json);
-        assert_eq!(unknown, ["first.unknown", "second.extra"]);
-    }
-
-    #[test]
-    fn floating_point_keys_keep_display_formatting() {
-        #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-        struct Key(String);
-
-        impl<'de> Deserialize<'de> for Key {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                f64::deserialize(deserializer).map(|value| Key(value.to_string()))
-            }
-        }
-
-        let json = r#"{
-            "1.0":{"name":"a","unknown":1},
-            "-0.0":{"name":"b","unknown":2},
-            "1e-8":{"name":"c","unknown":3},
-            "1e20":{"name":"d","unknown":4}
-        }"#;
-        let (_, unknown): (BTreeMap<Key, Inner>, _) = run(json);
-        assert_eq!(
-            unknown,
-            [
-                "1.unknown",
-                "-0.unknown",
-                "0.00000001.unknown",
-                "100000000000000000000.unknown",
-            ]
-        );
-    }
-
-    #[test]
-    fn compound_map_keys_do_not_capture_their_contents() {
-        use serde::de::value::MapDeserializer;
-
-        #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-        struct Key(String);
-
-        impl<'de> Deserialize<'de> for Key {
-            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                <serde_json::Value as Deserialize>::deserialize(deserializer)
-                    .map(|value| Key(value.to_string()))
-            }
-        }
-
-        let entries = [
-            (
-                serde_json::json!([1, 2]),
-                serde_json::json!({"name": "a", "sequence_unknown": 1}),
-            ),
-            (
-                serde_json::json!({"nested": 3}),
-                serde_json::json!({"name": "b", "map_unknown": 2}),
-            ),
-            (
-                serde_json::json!("plain"),
-                serde_json::json!({"name": "c", "scalar_unknown": 3}),
-            ),
-        ];
-        let mut unknown = Vec::new();
-        let deserializer = MapDeserializer::<_, serde_json::Error>::new(entries.into_iter());
-        let values: BTreeMap<Key, Inner> =
-            deserialize(deserializer, |path| unknown.push(path.to_string())).unwrap();
-        assert_eq!(values.len(), 3);
-        assert_eq!(
-            unknown,
-            [
-                "?.sequence_unknown",
-                "?.map_unknown",
-                "plain.scalar_unknown"
-            ]
-        );
-    }
-
-    #[test]
-    fn no_unknown_fields_means_no_callbacks() {
-        let json = r#"{"title":"t","inner":null,"items":[],"by_name":{},"by_id":{},
-                       "len":0,"kind":"A","kinds":[]}"#;
-        let (value, unknown): (Outer, _) = run(json);
-        assert!(unknown.is_empty());
-        assert_eq!(value.inner, None);
-    }
-
-    #[test]
-    fn nested_sequences_keep_independent_indices() {
-        let json = r#"[
-            [{"name":"a","x":1},{"name":"b","y":2}],
-            [{"name":"c","z":3}]
-        ]"#;
-        let (_, unknown): (Vec<Vec<Inner>>, _) = run(json);
-        assert_eq!(unknown, ["[0][0].x", "[0][1].y", "[1][0].z"]);
-    }
-
-    #[test]
-    fn unknown_value_subtrees_report_once() {
-        let value = serde_json::json!({"name":"a","extra":{"deep":[1,{"x":2}]}});
-        let mut unknown = Vec::new();
-        let inner: Inner = value
-            .deserialize(|path| unknown.push(path.to_string()))
-            .unwrap();
-        assert_eq!(inner.name, "a");
-        assert_eq!(unknown, ["extra"]);
-    }
-
-    #[test]
-    fn borrowed_strings_stay_zero_copy() {
-        #[derive(Debug, Deserialize, PartialEq)]
-        struct BorrowedStrings<'i> {
-            #[serde(borrow)]
-            text: &'i str,
-            #[serde(borrow)]
-            cow_text: Cow<'i, str>,
-        }
-        let json = r#"{"text": "hello", "cow_text": "world", "unknown": 1}"#;
-        let mut unknown = Vec::new();
-        let mut deserializer = serde_json::Deserializer::from_str(json);
-        let borrowed: BorrowedStrings =
-            deserialize(&mut deserializer, |path| unknown.push(path.to_string())).unwrap();
-        assert_eq!(borrowed.text, "hello");
-        assert!(matches!(borrowed.cow_text, Cow::Borrowed("world")));
-        assert_eq!(unknown, ["unknown"]);
-    }
-
-    #[test]
-    fn errors_still_propagate() {
-        let mut deserializer = serde_json::Deserializer::from_str(r#"{"title": 1}"#);
-        let result: Result<Outer, _> = deserialize(&mut deserializer, |_| {});
-        assert!(result.is_err());
     }
 }

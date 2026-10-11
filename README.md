@@ -24,12 +24,45 @@ fn main() -> Result<(), serde_json::Error> {
         if path.matches(&["<root>", "future"]) {
             eprintln!("Unknown field: {path}");
         }
+        Ok(())
     })?;
     deserializer.end()?;
     assert_eq!(config.port, 8080);
     Ok(())
 }
 ```
+
+The callback returns `Result<(), D::Error>`. Return `Ok(())` to continue, or
+return the deserializer's native error to reject the input:
+
+```rust
+use serde::{Deserialize, de::Error};
+use serde_unknown::DeserializerExt;
+
+#[derive(Deserialize)]
+struct Config {
+    port: u16,
+}
+
+let mut deserializer = serde_json::Deserializer::from_str(
+    r#"{"port":8080,"forbidden":{"nested":true}}"#,
+);
+let result: Result<Config, _> = (&mut deserializer).deserialize(|path| {
+    if path.matches(&["<root>", "forbidden"]) {
+        return Err(Error::custom("forbidden field"));
+    }
+    Ok(())
+});
+assert_eq!(result.err().unwrap().to_string(), "forbidden field");
+```
+
+The callback runs before the adapter delegates consumption of the unknown value.
+The first callback error is saved and returned unchanged from the outermost call,
+even if a nested deserializer uses a different error type. Nested code can catch
+the intermediate error and continue executing, but the outermost call still
+returns the saved error. Subsequent callbacks are not invoked after rejection.
+Saving the error requires no heap allocation. Intermediate deserializers may
+construct errors to stop processing, and error construction can allocate.
 
 Paths use a stack-linked list. Keys use `CompactString`, so short keys stay inline
 while long keys may allocate. Invalid values and duplicate fields still return
