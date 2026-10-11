@@ -1,11 +1,14 @@
 # serde-unknown
 
-Track and ignore unknown fields during Serde deserialization, including struct
+Handle unknown fields during Serde deserialization, including struct
 fields that would normally be rejected by `deny_unknown_fields` or pbjson.
-The callback receives the field path; the caller chooses how to report it.
+The callback receives the field path; the caller chooses how to handle it.
+Use `DeserializerExt::deserialize` for method syntax, or the
+`serde_unknown::deserialize` function for the same behavior.
 
 ```rust
 use serde::Deserialize;
+use serde_unknown::DeserializerExt;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -17,7 +20,7 @@ fn main() -> Result<(), serde_json::Error> {
     let mut deserializer = serde_json::Deserializer::from_str(
         r#"{"port":8080,"future":{"nested":true}}"#,
     );
-    let config: Config = serde_unknown::deserialize(&mut deserializer, |path| {
+    let config: Config = (&mut deserializer).deserialize(|path| {
         eprintln!("Unknown field: {path}");
     })?;
     deserializer.end()?;

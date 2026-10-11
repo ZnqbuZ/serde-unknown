@@ -26,14 +26,14 @@ impl fmt::Display for Path<'_> {
     }
 }
 
-pub fn deserialize<'de, D, T, F>(deserializer: D, on_ignored: F) -> Result<T, D::Error>
+pub fn deserialize<'de, D, T, F>(deserializer: D, on_unknown: F) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
     F: FnMut(&Path<'_>),
 {
     let mut state = State {
-        on_ignored,
+        on_unknown,
         key: None,
         index: 0,
     };
@@ -41,8 +41,20 @@ where
     T::deserialize(Tracker::new(deserializer, &mut state, &path))
 }
 
+pub trait DeserializerExt<'de>: Deserializer<'de> {
+    fn deserialize<T, F>(self, on_unknown: F) -> Result<T, Self::Error>
+    where
+        T: Deserialize<'de>,
+        F: FnMut(&Path<'_>),
+    {
+        deserialize(self, on_unknown)
+    }
+}
+
+impl<'de, D: Deserializer<'de>> DeserializerExt<'de> for D {}
+
 struct State<F> {
-    on_ignored: F,
+    on_unknown: F,
     key: Option<CompactString>,
     index: usize,
 }
@@ -208,7 +220,7 @@ impl<'de, 's, 'p, D: Deserializer<'de>, F: FnMut(&Path<'_>)> Deserializer<'de>
     }
 
     fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        (self.state.on_ignored)(self.path);
+        (self.state.on_unknown)(self.path);
         self.inner.deserialize_ignored_any(visitor)
     }
 
@@ -464,14 +476,14 @@ mod tests {
     where
         T: for<'de> Deserialize<'de> + PartialEq + fmt::Debug,
     {
-        let mut ignored = Vec::new();
+        let mut unknown = Vec::new();
         let mut deserializer = serde_json::Deserializer::from_str(json);
         let value: T =
-            deserialize(&mut deserializer, |path| ignored.push(path.to_string())).unwrap();
+            deserialize(&mut deserializer, |path| unknown.push(path.to_string())).unwrap();
         deserializer.end().unwrap();
         let plain: T = serde_json::from_str(json).unwrap();
         assert_eq!(value, plain, "wrapper must not change the result");
-        (value, ignored)
+        (value, unknown)
     }
 
     #[test]
@@ -488,9 +500,9 @@ mod tests {
             "kinds": ["A", {"C": {"x": {"name": "c", "k": 0}}}, {"D": [1, {"name": "d", "q": 2}]}],
             "ex\u0074ra2": "escaped key"
         }"#;
-        let (_, ignored): (Outer, _) = run(json);
+        let (_, unknown): (Outer, _) = run(json);
         assert_eq!(
-            ignored,
+            unknown,
             [
                 "extra",
                 "inner.zzz",
@@ -532,17 +544,17 @@ mod tests {
         }"#;
         assert!(serde_json::from_str::<Strict>(json).is_err());
 
-        let mut ignored = Vec::new();
+        let mut unknown = Vec::new();
         let mut deserializer = serde_json::Deserializer::from_str(json);
         let value: Strict =
-            deserialize(&mut deserializer, |path| ignored.push(path.to_string())).unwrap();
+            deserialize(&mut deserializer, |path| unknown.push(path.to_string())).unwrap();
         deserializer.end().unwrap();
 
         assert_eq!(value.name, "root");
         assert_eq!(value.by_name["arbitrary"].name, "map");
         assert_eq!(value.items[0].name, "item");
         assert_eq!(
-            ignored,
+            unknown,
             [
                 "before",
                 "middle",
@@ -554,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_structs_ignore_all_fields() {
+    fn empty_structs_report_all_fields() {
         #[derive(Debug, Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Empty {}
@@ -562,29 +574,29 @@ mod tests {
         let json = r#"{"first": 1, "second": {"nested": true}}"#;
         assert!(serde_json::from_str::<Empty>(json).is_err());
 
-        let mut ignored = Vec::new();
+        let mut unknown = Vec::new();
         let mut deserializer = serde_json::Deserializer::from_str(json);
         let _: Empty =
-            deserialize(&mut deserializer, |path| ignored.push(path.to_string())).unwrap();
+            deserialize(&mut deserializer, |path| unknown.push(path.to_string())).unwrap();
         deserializer.end().unwrap();
-        assert_eq!(ignored, ["first", "second"]);
+        assert_eq!(unknown, ["first", "second"]);
     }
 
     #[test]
     fn structs_still_accept_sequences() {
-        let (value, ignored): (Inner, _) = run(r#"["name", null]"#);
+        let (value, unknown): (Inner, _) = run(r#"["name", null]"#);
         assert_eq!(value.name, "name");
-        assert!(ignored.is_empty());
+        assert!(unknown.is_empty());
     }
 
     #[test]
     fn struct_field_indices_and_bytes_are_forwarded() {
         fn check<'de, D: Deserializer<'de>>(deserializer: D) {
-            let mut ignored = Vec::new();
+            let mut unknown = Vec::new();
             let value: Inner =
-                deserialize(deserializer, |path| ignored.push(path.to_string())).unwrap();
+                deserialize(deserializer, |path| unknown.push(path.to_string())).unwrap();
             assert_eq!(value.name, "name");
-            assert!(ignored.is_empty());
+            assert!(unknown.is_empty());
         }
 
         use de::value::{BorrowedBytesDeserializer, BytesDeserializer, Error, MapDeserializer};
@@ -614,9 +626,9 @@ mod tests {
             "boolean": {"true": {"name": "x", "z3": 0}},
             "character": {"x":    {"name": "x", "z4": 0}}
         }"#;
-        let (_, ignored): (Keys, _) = run(json);
+        let (_, unknown): (Keys, _) = run(json);
         assert_eq!(
-            ignored,
+            unknown,
             [
                 "signed.-3.z1",
                 "unsigned.200.z2",
@@ -632,8 +644,8 @@ mod tests {
         struct Key(String);
 
         let json = r#"{"first":{"name":"a","unknown":1},"second":{"name":"b","extra":2}}"#;
-        let (_, ignored): (BTreeMap<Option<Key>, Inner>, _) = run(json);
-        assert_eq!(ignored, ["first.unknown", "second.extra"]);
+        let (_, unknown): (BTreeMap<Option<Key>, Inner>, _) = run(json);
+        assert_eq!(unknown, ["first.unknown", "second.extra"]);
     }
 
     #[test]
@@ -653,9 +665,9 @@ mod tests {
             "1e-8":{"name":"c","unknown":3},
             "1e20":{"name":"d","unknown":4}
         }"#;
-        let (_, ignored): (BTreeMap<Key, Inner>, _) = run(json);
+        let (_, unknown): (BTreeMap<Key, Inner>, _) = run(json);
         assert_eq!(
-            ignored,
+            unknown,
             [
                 "1.unknown",
                 "-0.unknown",
@@ -674,7 +686,8 @@ mod tests {
 
         impl<'de> Deserialize<'de> for Key {
             fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-                serde_json::Value::deserialize(deserializer).map(|value| Key(value.to_string()))
+                <serde_json::Value as Deserialize>::deserialize(deserializer)
+                    .map(|value| Key(value.to_string()))
             }
         }
 
@@ -692,13 +705,13 @@ mod tests {
                 serde_json::json!({"name": "c", "scalar_unknown": 3}),
             ),
         ];
-        let mut ignored = Vec::new();
+        let mut unknown = Vec::new();
         let deserializer = MapDeserializer::<_, serde_json::Error>::new(entries.into_iter());
         let values: BTreeMap<Key, Inner> =
-            deserialize(deserializer, |path| ignored.push(path.to_string())).unwrap();
+            deserialize(deserializer, |path| unknown.push(path.to_string())).unwrap();
         assert_eq!(values.len(), 3);
         assert_eq!(
-            ignored,
+            unknown,
             [
                 "?.sequence_unknown",
                 "?.map_unknown",
@@ -711,8 +724,8 @@ mod tests {
     fn no_unknown_fields_means_no_callbacks() {
         let json = r#"{"title":"t","inner":null,"items":[],"by_name":{},"by_id":{},
                        "len":0,"kind":"A","kinds":[]}"#;
-        let (value, ignored): (Outer, _) = run(json);
-        assert!(ignored.is_empty());
+        let (value, unknown): (Outer, _) = run(json);
+        assert!(unknown.is_empty());
         assert_eq!(value.inner, None);
     }
 
@@ -722,17 +735,19 @@ mod tests {
             [{"name":"a","x":1},{"name":"b","y":2}],
             [{"name":"c","z":3}]
         ]"#;
-        let (_, ignored): (Vec<Vec<Inner>>, _) = run(json);
-        assert_eq!(ignored, ["[0][0].x", "[0][1].y", "[1][0].z"]);
+        let (_, unknown): (Vec<Vec<Inner>>, _) = run(json);
+        assert_eq!(unknown, ["[0][0].x", "[0][1].y", "[1][0].z"]);
     }
 
     #[test]
-    fn ignored_value_subtrees_report_once() {
+    fn unknown_value_subtrees_report_once() {
         let value = serde_json::json!({"name":"a","extra":{"deep":[1,{"x":2}]}});
-        let mut ignored = Vec::new();
-        let inner: Inner = deserialize(value, |path| ignored.push(path.to_string())).unwrap();
+        let mut unknown = Vec::new();
+        let inner: Inner = value
+            .deserialize(|path| unknown.push(path.to_string()))
+            .unwrap();
         assert_eq!(inner.name, "a");
-        assert_eq!(ignored, ["extra"]);
+        assert_eq!(unknown, ["extra"]);
     }
 
     #[test]
@@ -745,13 +760,13 @@ mod tests {
             cow_text: Cow<'i, str>,
         }
         let json = r#"{"text": "hello", "cow_text": "world", "unknown": 1}"#;
-        let mut ignored = Vec::new();
+        let mut unknown = Vec::new();
         let mut deserializer = serde_json::Deserializer::from_str(json);
         let borrowed: BorrowedStrings =
-            deserialize(&mut deserializer, |path| ignored.push(path.to_string())).unwrap();
+            deserialize(&mut deserializer, |path| unknown.push(path.to_string())).unwrap();
         assert_eq!(borrowed.text, "hello");
         assert!(matches!(borrowed.cow_text, Cow::Borrowed("world")));
-        assert_eq!(ignored, ["unknown"]);
+        assert_eq!(unknown, ["unknown"]);
     }
 
     #[test]
