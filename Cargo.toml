@@ -1,14 +1,14 @@
 [package]
 name = "serde-unknown"
+repository = "https://github.com/ZnqbuZ/serde-unknown"
 version = "0.1.0"
 edition = "2024"
-description = "Handle unknown fields during Serde deserialization."
 license = "MIT OR Apache-2.0"
-readme = "README.md"
-repository = "https://github.com/ZnqbuZ/serde-unknown"
-documentation = "https://docs.rs/serde-unknown"
 keywords = ["serde", "deserialization", "unknown-fields", "protobuf", "json"]
 categories = ["encoding", "no-std"]
+description = "Handle unknown fields during Serde deserialization."
+readme = "README.md"
+documentation = "https://docs.rs/serde-unknown"
 
 [package.metadata.docs.rs]
 all-features = true
