@@ -1,15 +1,19 @@
 # serde-unknown
 
-Handle unknown fields during Serde deserialization: log their paths, reject
-them with a native deserializer error, or inspect selected values.
+**Handle unknown fields during Serde deserialization: log their paths, reject
+them with a native deserializer error, or inspect selected values.**
+
+[![crates.io](https://img.shields.io/crates/v/serde-unknown.svg)](https://crates.io/crates/serde-unknown)
+[![Documentation](https://docs.rs/serde-unknown/badge.svg)](https://docs.rs/serde-unknown)
+[![CI](https://github.com/ZnqbuZ/serde-unknown/actions/workflows/rust.yml/badge.svg)](https://github.com/ZnqbuZ/serde-unknown/actions/workflows/rust.yml)
+[![no_std](https://img.shields.io/badge/no__std-compatible-blue.svg)](#features-and-allocation)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+[API documentation](https://docs.rs/serde-unknown)
 
 Works with ordinary Serde structs, `#[serde(deny_unknown_fields)]`, and
 pbjson-generated messages. Callbacks use static dispatch, and paths are tracked
 with a stack-linked list.
-
-[crates.io](https://crates.io/crates/serde-unknown) ·
-[API documentation](https://docs.rs/serde-unknown) ·
-[Source](https://github.com/ZnqbuZ/serde-unknown)
 
 ## Installation
 
@@ -236,6 +240,9 @@ underlying deserializer and the application.
 
 ## License
 
-Licensed under either [MIT](https://github.com/ZnqbuZ/serde-unknown/blob/master/LICENSE)
-or [Apache-2.0](https://github.com/ZnqbuZ/serde-unknown/blob/master/LICENSE-APACHE),
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
 at your option.
